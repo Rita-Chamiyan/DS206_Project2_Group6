@@ -1,6 +1,7 @@
 from typing import Any, Dict
 
 from utils import generate_execution_id
+from logging import setup_logger
 from pipeline_dimensional_data import config
 from pipeline_dimensional_data.tasks import (
     update_dimensions_task,
@@ -39,6 +40,7 @@ class DimensionalDataFlow:
         self.database_name = database_name
         self.schema_name = schema_name
         self.execution_id = generate_execution_id()
+        self.logger = setup_logger(self.execution_id)
 
     def exec(
         self,
@@ -78,6 +80,8 @@ class DimensionalDataFlow:
             execution_id=self.execution_id,
             previous_task_result=fact_error_result,
         )
+
+        self.logger.info("Dimensional data flow completed successfully")
 
         return {
             "success": fact_result["success"],

@@ -1,220 +1,90 @@
-import pandas as pd
+from pathlib import Path
+
 import pyodbc
-import math
+from openpyxl import load_workbook
 
-# ---------- Helpers ----------
-def clean_value(value):
-    if pd.isna(value):
-        return None
-    if isinstance(value, float) and math.isnan(value):
-        return None
-    return value
+from utils import get_sql_config, create_connection_string
 
 
-def clean_row(row, columns):
-    return [clean_value(row[col]) for col in columns]
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_EXCEL_PATH = PROJECT_ROOT / "data" / "raw" / "raw_data_source.xlsx"
+CONFIG_PATH = PROJECT_ROOT / "sql_server_config.cfg"
 
 
-# ---------- Connection ----------
-conn = pyodbc.connect(
-    'DRIVER={ODBC Driver 18 for SQL Server};'
-    'SERVER=WIN-3LU72C19LPR;'
-    'DATABASE=ORDER_DDS;'
-    'Trusted_Connection=yes;'
-    'Encrypt=no;'
-    'TrustServerCertificate=yes;'
-)
-
-cursor = conn.cursor()
-
-xlsx = "data/raw/raw_data_source.xlsx"
-
-
-# Optional: clear old staging data before loading again
-staging_tables = [
-    "Staging_Order_Details",
-    "Staging_Orders",
-    "Staging_Products",
-    "Staging_Territories",
-    "Staging_Suppliers",
-    "Staging_Shippers",
-    "Staging_Region",
-    "Staging_Employees",
-    "Staging_Customers",
-    "Staging_Categories"
-]
-
-for table in staging_tables:
-    cursor.execute(f"DELETE FROM dbo.{table}")
-
-conn.commit()
+SHEET_TO_TABLE = {
+    "Categories": "Staging_Categories",
+    "Customers": "Staging_Customers",
+    "Employees": "Staging_Employees",
+    "OrderDetails": "Staging_Order_Details",
+    "Orders": "Staging_Orders",
+    "Products": "Staging_Products",
+    "Region": "Staging_Region",
+    "Shippers": "Staging_Shippers",
+    "Suppliers": "Staging_Suppliers",
+    "Territories": "Staging_Territories",
+}
 
 
-# ── 1. Categories ──────────────────────────────────────────
-df = pd.read_excel(xlsx, sheet_name="Categories").astype(object)
+def load_excel_to_staging(
+    excel_path: Path = DEFAULT_EXCEL_PATH,
+    config_path: Path = CONFIG_PATH,
+):
+    if not excel_path.exists():
+        raise FileNotFoundError(
+            f"Raw Excel file not found: {excel_path}. "
+            "Place raw_data_source.xlsx in data/raw/."
+        )
 
-for _, row in df.iterrows():
-    cursor.execute("""
-        INSERT INTO dbo.Staging_Categories
-        (CategoryID, CategoryName, Description)
-        VALUES (?, ?, ?)
-    """, *clean_row(row, ["CategoryID", "CategoryName", "Description"]))
+    sql_config = get_sql_config(str(config_path))
+    connection_string = create_connection_string(sql_config)
 
-print(f"Categories loaded: {len(df)} rows")
+    workbook = load_workbook(excel_path, data_only=True)
+    connection = pyodbc.connect(connection_string)
+    cursor = connection.cursor()
 
+    try:
+        for sheet_name, table_name in SHEET_TO_TABLE.items():
+            if sheet_name not in workbook.sheetnames:
+                raise ValueError(f"Missing sheet in Excel file: {sheet_name}")
 
-# ── 2. Customers ───────────────────────────────────────────
-df = pd.read_excel(xlsx, sheet_name="Customers").astype(object)
+            worksheet = workbook[sheet_name]
+            rows = list(worksheet.iter_rows(values_only=True))
 
-for _, row in df.iterrows():
-    cursor.execute("""
-        INSERT INTO dbo.Staging_Customers
-        (CustomerID, CompanyName, ContactName, ContactTitle,
-         Address, City, Region, PostalCode, Country, Phone, Fax)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-    """, *clean_row(row, [
-        "CustomerID", "CompanyName", "ContactName", "ContactTitle",
-        "Address", "City", "Region", "PostalCode", "Country", "Phone", "Fax"
-    ]))
+            if not rows:
+                print(f"Skipping empty sheet: {sheet_name}")
+                continue
 
-print(f"Customers loaded: {len(df)} rows")
+            columns = list(rows[0])
+            data_rows = rows[1:]
 
+            placeholders = ", ".join(["?"] * len(columns))
+            column_sql = ", ".join(f"[{column}]" for column in columns)
 
-# ── 3. Employees ───────────────────────────────────────────
-df = pd.read_excel(xlsx, sheet_name="Employees").astype(object)
+            cursor.execute(f"DELETE FROM dbo.{table_name};")
 
-for _, row in df.iterrows():
-    cursor.execute("""
-        INSERT INTO dbo.Staging_Employees
-        (EmployeeID, LastName, FirstName, Title, TitleOfCourtesy,
-         BirthDate, HireDate, Address, City, Region, PostalCode,
-         Country, HomePhone, Extension, Notes, ReportsTo, PhotoPath)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, *clean_row(row, [
-        "EmployeeID", "LastName", "FirstName", "Title", "TitleOfCourtesy",
-        "BirthDate", "HireDate", "Address", "City", "Region", "PostalCode",
-        "Country", "HomePhone", "Extension", "Notes", "ReportsTo", "PhotoPath"
-    ]))
+            insert_sql = (
+                f"INSERT INTO dbo.{table_name} ({column_sql}) "
+                f"VALUES ({placeholders})"
+            )
 
-print(f"Employees loaded: {len(df)} rows")
+            loaded_rows = 0
+            for row in data_rows:
+                cursor.execute(insert_sql, row)
+                loaded_rows += 1
 
+            print(f"Loaded {loaded_rows} rows into {table_name}")
 
-# ── 4. Region ──────────────────────────────────────────────
-df = pd.read_excel(xlsx, sheet_name="Region").astype(object)
+        connection.commit()
+        return {"success": True}
 
-for _, row in df.iterrows():
-    cursor.execute("""
-        INSERT INTO dbo.Staging_Region
-        (RegionID, RegionDescription, RegionCategory, RegionImportance)
-        VALUES (?,?,?,?)
-    """, *clean_row(row, [
-        "RegionID", "RegionDescription", "RegionCategory", "RegionImportance"
-    ]))
+    except Exception:
+        connection.rollback()
+        raise
 
-print(f"Region loaded: {len(df)} rows")
+    finally:
+        connection.close()
 
 
-# ── 5. Shippers ────────────────────────────────────────────
-df = pd.read_excel(xlsx, sheet_name="Shippers").astype(object)
-
-for _, row in df.iterrows():
-    cursor.execute("""
-        INSERT INTO dbo.Staging_Shippers
-        (ShipperID, CompanyName, Phone)
-        VALUES (?,?,?)
-    """, *clean_row(row, ["ShipperID", "CompanyName", "Phone"]))
-
-print(f"Shippers loaded: {len(df)} rows")
-
-
-# ── 6. Suppliers ───────────────────────────────────────────
-df = pd.read_excel(xlsx, sheet_name="Suppliers").astype(object)
-
-for _, row in df.iterrows():
-    cursor.execute("""
-        INSERT INTO dbo.Staging_Suppliers
-        (SupplierID, CompanyName, ContactName, ContactTitle,
-         Address, City, Region, PostalCode, Country, Phone, Fax, HomePage)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-    """, *clean_row(row, [
-        "SupplierID", "CompanyName", "ContactName", "ContactTitle",
-        "Address", "City", "Region", "PostalCode", "Country",
-        "Phone", "Fax", "HomePage"
-    ]))
-
-print(f"Suppliers loaded: {len(df)} rows")
-
-
-# ── 7. Territories ─────────────────────────────────────────
-df = pd.read_excel(xlsx, sheet_name="Territories").astype(object)
-
-for _, row in df.iterrows():
-    cursor.execute("""
-        INSERT INTO dbo.Staging_Territories
-        (TerritoryID, TerritoryDescription, TerritoryCode, RegionID)
-        VALUES (?,?,?,?)
-    """, *clean_row(row, [
-        "TerritoryID", "TerritoryDescription", "TerritoryCode", "RegionID"
-    ]))
-
-print(f"Territories loaded: {len(df)} rows")
-
-
-# ── 8. Products ────────────────────────────────────────────
-df = pd.read_excel(xlsx, sheet_name="Products").astype(object)
-
-for _, row in df.iterrows():
-    cursor.execute("""
-        INSERT INTO dbo.Staging_Products
-        (ProductID, ProductName, SupplierID, CategoryID,
-         QuantityPerUnit, UnitPrice, UnitsInStock,
-         UnitsOnOrder, ReorderLevel, Discontinued)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
-    """, *clean_row(row, [
-        "ProductID", "ProductName", "SupplierID", "CategoryID",
-        "QuantityPerUnit", "UnitPrice", "UnitsInStock",
-        "UnitsOnOrder", "ReorderLevel", "Discontinued"
-    ]))
-
-print(f"Products loaded: {len(df)} rows")
-
-
-# ── 9. Orders ──────────────────────────────────────────────
-df = pd.read_excel(xlsx, sheet_name="Orders").astype(object)
-
-for _, row in df.iterrows():
-    cursor.execute("""
-        INSERT INTO dbo.Staging_Orders
-        (OrderID, CustomerID, EmployeeID, OrderDate, RequiredDate,
-         ShippedDate, ShipVia, Freight, ShipName, ShipAddress,
-         ShipCity, ShipRegion, ShipPostalCode, ShipCountry, TerritoryID)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, *clean_row(row, [
-        "OrderID", "CustomerID", "EmployeeID", "OrderDate", "RequiredDate",
-        "ShippedDate", "ShipVia", "Freight", "ShipName", "ShipAddress",
-        "ShipCity", "ShipRegion", "ShipPostalCode", "ShipCountry", "TerritoryID"
-    ]))
-
-print(f"Orders loaded: {len(df)} rows")
-
-
-# ── 10. OrderDetails ───────────────────────────────────────
-df = pd.read_excel(xlsx, sheet_name="OrderDetails").astype(object)
-
-for _, row in df.iterrows():
-    cursor.execute("""
-        INSERT INTO dbo.Staging_Order_Details
-        (OrderID, ProductID, UnitPrice, Quantity, Discount)
-        VALUES (?,?,?,?,?)
-    """, *clean_row(row, [
-        "OrderID", "ProductID", "UnitPrice", "Quantity", "Discount"
-    ]))
-
-print(f"OrderDetails loaded: {len(df)} rows")
-
-
-conn.commit()
-cursor.close()
-conn.close()
-
-print("\n✅ All staging tables loaded successfully!")
+if __name__ == "__main__":
+    result = load_excel_to_staging()
+    print(result)
